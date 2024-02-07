@@ -11,6 +11,7 @@ import uuid
 from optparse import OptionParser
 from threading import Thread, Lock
 from queue import Queue
+from pymemcache.exceptions import MemcacheError
 
 from pymemcache.client.base import PooledClient
 from pymemcache.client.retrying import RetryingClient
@@ -62,18 +63,29 @@ def insert_appsinstalled(memc, appsinstalled, dry_run=False):
     key = "%s:%s" % (appsinstalled.dev_type, appsinstalled.dev_id)
     ua.apps.extend(appsinstalled.apps)
     packed = ua.SerializeToString()
-    ip, port = memc._client.__getattribute__('server')
-    server_address = ':'.join((ip, str(port)))
+    ip, port = memc._client.server
+    server_address = f"{ip}:{port}"
+
     try:
         if dry_run:
             logging.debug(
-                "%s - %s -> %s" % (
-                    server_address, key, str(ua).replace("\n", " ")))
+                "%s - %s -> %s" % (server_address, key, str(ua).replace("\n", " "))
+            )
         else:
-            memc.set(key, packed)
-    except Exception as e:
-        logging.exception("Cannot write to memc %s: %s" % (server_address, e))
+            # Using set_multi for batch operations
+            memc.set_multi({key: packed})
+    except MemcacheUnexpectedCloseError as e:
+        logging.error("Memcache connection closed unexpectedly: %s" % e)
         return False
+    except MemcacheError as e:
+        logging.error("Memcache error: %s" % e)
+        return False
+    except Exception as e:
+        logging.exception(
+            "Unexpected error while writing to memcache %s: %s" % (server_address, e)
+        )
+        return False
+
     return True
 
 
@@ -143,6 +155,93 @@ class MemcacheWriter(Thread):
         Thread.join(self, timeout=0.1)
 
 
+def process_file(fn, memc_pool, maxworkers, dry):
+    task_queue = Queue(maxsize=4000)
+    lock = Lock()
+    results = {"processed": 0, "errors": 0}
+    writer_pool = [
+        MemcacheWriter(
+            task_queue=task_queue,
+            handler=insert_appsinstalled,
+            results=results,
+            lock=lock,
+            dry=dry,
+            _id=n,
+        )
+        for n in range(maxworkers)
+    ]
+    [writer.start() for writer in writer_pool]
+
+    logging.info("Processing %s" % fn)
+    fd = gzip.open(fn)
+
+    bar = progressbar.ProgressBar(maxval=progressbar.UnknownLength)
+    bar.start()
+    for i, line in enumerate(fd):
+        line = line.strip().decode("utf-8")
+        if not line:
+            continue
+        appsinstalled = parse_appsinstalled(line)
+        if not appsinstalled:
+            lock.acquire()
+            results["errors"] += 1
+            lock.release()
+            continue
+        memc = memc_pool.get(appsinstalled.dev_type)
+        if not memc:
+            lock.acquire()
+            results["errors"] += 1
+            lock.release()
+            logging.error("Unknown device type: %s" % appsinstalled.dev_type)
+            continue
+        task_queue.put((memc, appsinstalled))
+        bar.update(i)
+
+    task_queue.join()
+    [writer.terminate() for writer in writer_pool]
+    [writer.join() for writer in writer_pool]
+
+    processed = results["processed"]
+    errors = results["errors"]
+
+    if not processed:
+        logging.info(
+            "Closing and renaming file %s, no processed lines" % fn.split("/")[-1]
+        )
+        fd.close()
+        dot_rename(fn)
+        return
+
+    logging.info("Errors: %s, Processed: %s" % (errors, processed))
+    err_rate = float(errors) / processed
+    if err_rate < NORMAL_ERR_RATE:
+        logging.info("Acceptable error rate (%s). Successful load" % err_rate)
+    else:
+        logging.error(
+            "High error rate (%s > %s). Failed load" % (err_rate, NORMAL_ERR_RATE)
+        )
+    fd.close()
+    dot_rename(fn)
+
+
+def setup_writer_pool(task_queue, results, lock, maxworkers, dry):
+    return [
+        MemcacheWriter(
+            task_queue=task_queue,
+            handler=insert_appsinstalled,
+            results=results,
+            lock=lock,
+            dry=dry,
+            _id=n,
+        )
+        for n in range(maxworkers)
+    ]
+
+
+def start_writer_pool(writer_pool):
+    [writer.start() for writer in writer_pool]
+
+
 def main(options):
     device_memc = {
         "idfa": options.idfa,
@@ -150,80 +249,18 @@ def main(options):
         "adid": options.adid,
         "dvid": options.dvid,
     }
-    memc_pool: dict = create_mmc_pool(device_memc, options.maxworkers)
+    memc_pool = create_mmc_pool(device_memc, options.maxworkers)
+
     for fn in glob.iglob(options.pattern):
         task_queue = Queue(maxsize=4000)
         lock = Lock()
-        results = {
-            'processed': 0,
-            'errors': 0
-        }
-        writer_pool = [
-            MemcacheWriter(
-                task_queue=task_queue,
-                handler=insert_appsinstalled,
-                results=results,
-                lock=lock,
-                dry=options.dry,
-                _id=n
-            ) for n in range(options.maxworkers)
-        ]
-        [writer.start() for writer in writer_pool]
-        logging.info('Processing %s' % fn)
-        fd = gzip.open(fn)
+        results = {"processed": 0, "errors": 0}
+        writer_pool = setup_writer_pool(
+            task_queue, results, lock, options.maxworkers, options.dry
+        )
+        start_writer_pool(writer_pool)
 
-        bar = progressbar.ProgressBar(max_value=progressbar.UnknownLength)
-        for i, line in enumerate(fd):
-            line = line.strip().decode('utf-8')
-            if not line:
-                continue
-            appsinstalled = parse_appsinstalled(line)
-            if not appsinstalled:
-                lock.acquire()
-                results['errors'] += 1
-                lock.release()
-                continue
-            memc = memc_pool.get(appsinstalled.dev_type)
-            if not memc:
-                lock.acquire()
-                results['errors'] += 1
-                lock.release()
-                logging.error(
-                    "Unknown device type: %s" % appsinstalled.dev_type
-                )
-                continue
-            task_queue.put((memc, appsinstalled))
-            bar.update(i)
-
-        task_queue.join()
-        [writer.terminate() for writer in writer_pool]
-        [writer.join() for writer in writer_pool]
-
-        processed = results['processed']
-        errors = results['errors']
-
-        if not processed:
-            logging.info(
-                'Closing and renaming file %s, no processed lines' %
-                fn.split('/')[-1]
-            )
-            fd.close()
-            dot_rename(fn)
-            continue
-
-        logging.info('Errors: %s, Processed: %s' % (errors, processed))
-        err_rate = float(errors) / processed
-        if err_rate < NORMAL_ERR_RATE:
-            logging.info(
-                "Acceptable error rate (%s). Successfull load" % err_rate)
-        else:
-            logging.error(
-                "High error rate (%s > %s). Failed load" % (
-                    err_rate, NORMAL_ERR_RATE
-                    )
-                )
-        fd.close()
-        dot_rename(fn)
+        process_file(fn, memc_pool, options.maxworkers, options.dry)
 
 
 def runtest():
